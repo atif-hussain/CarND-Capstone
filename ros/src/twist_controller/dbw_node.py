@@ -6,7 +6,10 @@ from dbw_mkz_msgs.msg import ThrottleCmd, SteeringCmd, BrakeCmd, SteeringReport
 from geometry_msgs.msg import TwistStamped
 import math
 
-from twist_controller import Controller
+from twist_controller import TwistController, VehicleInfo
+from styx_msgs.msg import Lane
+from multiprocessing import Lock
+
 
 '''
 You can build this node only after you have built (or partially built) the `waypoint_updater` node.
@@ -46,6 +49,11 @@ class DBWNode(object):
         max_lat_accel = rospy.get_param('~max_lat_accel', 3.)
         max_steer_angle = rospy.get_param('~max_steer_angle', 8.)
 
+		# create vehicle_info
+        vehicle_info = VehicleInfo(vehicle_mass, fuel_capacity, brake_deadband, decel_limit,
+                                   accel_limit, wheel_radius, wheel_base, steer_ratio,
+                                   max_lat_accel, max_steer_angle)
+
         self.steer_pub = rospy.Publisher('/vehicle/steering_cmd',
                                          SteeringCmd, queue_size=1)
         self.throttle_pub = rospy.Publisher('/vehicle/throttle_cmd',
@@ -54,9 +62,19 @@ class DBWNode(object):
                                          BrakeCmd, queue_size=1)
 
         # TODO: Create `TwistController` object
-        # self.controller = TwistController(<Arguments you wish to provide>)
+        self.controller = TwistController(vehicle_info)
+        self.dbw_enabled = True
+        self.current_velocity = None
+        self.twist_cmd = None
+
+        # lock is required because in rospy subscriber's callbacks are executed in separate threads
+        # https://answers.ros.org/question/110336/python-spin-once-equivalent/
+        self.lock = Lock()
 
         # TODO: Subscribe to all the topics you need to
+        rospy.Subscriber('/vehicle/dbw_enabled', Bool, self.dbw_enabled_cb, queue_size=1)
+        rospy.Subscriber('/current_velocity', TwistStamped, self.current_velocity_cb)
+        rospy.Subscriber('/twist_cmd', TwistStamped, self.twist_cmd_cb)
 
         self.loop()
 
@@ -65,13 +83,18 @@ class DBWNode(object):
         while not rospy.is_shutdown():
             # TODO: Get predicted throttle, brake, and steering using `twist_controller`
             # You should only publish the control commands if dbw is enabled
+            with self.lock:
+                twist_cmd = self.twist_cmd
+                current_velocity = self.current_velocity
+                dbw_enabled = self.dbw_enabled
+
+            if not (twist_cmd is None or current_velocity is None):
+                throttle, brake, steering = self.controller.control(twist_cmd, current_velocity, dbw_enabled)
             # throttle, brake, steering = self.controller.control(<proposed linear velocity>,
-            #                                                     <proposed angular velocity>,
-            #                                                     <current linear velocity>,
-            #                                                     <dbw status>,
-            #                                                     <any other argument you need>)
-            # if <dbw is enabled>:
-            #   self.publish(throttle, brake, steer)
+	            #      <proposed angular velocity>, <current linear velocity>, <dbw status>, <any other argument you need>)
+                if dbw_enabled:
+                    self.publish(throttle, brake, steering)
+
             rate.sleep()
 
     def publish(self, throttle, brake, steer):
@@ -88,9 +111,21 @@ class DBWNode(object):
 
         bcmd = BrakeCmd()
         bcmd.enable = True
-        bcmd.pedal_cmd_type = BrakeCmd.CMD_TORQUE
+        bcmd.pedal_cmd_type = BrakeCmd.CMD_PERCENT
         bcmd.pedal_cmd = brake
         self.brake_pub.publish(bcmd)
+
+    def dbw_enabled_cb(self, dbw_enabled):
+        with self.lock:
+            self.dbw_enabled = dbw_enabled
+
+    def current_velocity_cb(self, velocity):
+        with self.lock:
+            self.current_velocity = velocity
+
+    def twist_cmd_cb(self, twist_cmd):
+        with self.lock:
+            self.twist_cmd = twist_cmd
 
 
 if __name__ == '__main__':
